@@ -1,146 +1,181 @@
-"""
-############################
-# 1st phase - all in 1 app #
-############################
-1. flask hello world
-
-2. add other flask endpoints
-
-3. hard code responses
-
-4. look up how to accept only POST (GET is default)
-
-5. return html for GET /
-<form method="post" enctype="multipart/form-data" action="/upload" method="post">
-  <div>
-    <label for="file">Choose file to upload</label>
-    <input type="file" id="file" name="form_file" accept="image/jpeg"/>
-  </div>
-  <div>
-    <button>Submit</button>
-  </div>
-</form>
-
-6. in GET /files return a hardcoded list for initial testing
-files = ['file1.jpeg', 'file2.jpeg', 'file3.jpeg']
-
-7. in GET / call the function for GET /files and loop through the list to add to the HTML
-GET /
-    ...
-    for file in list_files():
-        index_html += "<li><a href=\"/files/" + file + "\">" + file + "</a></li>"
-
-    return index_html
-
-8. in POST /upload - lookup how to extract uploaded file and save locally to ./files
-def upload():
-    file = request.files['form_file']  # item name must match name in HTML form
-    file.save(os.path.join("./files", file.filename))
-
-    return redirect("/")
-#https://flask.palletsprojects.com/en/2.2.x/patterns/fileuploads/
-
-9. in GET /files - look up how to list files in a directory
-
-    files = os.listdir("./files")
-    #TODO: filter jpeg only
-    return files
-
-10. filter only .jpeg
-@app.route('/files')
-def list_files():
-    files = os.listdir("./files")
-    for file in files:
-        if not file.endswith(".jpeg"):
-            files.remove(file)
-    return files
-"""
 import os
-import sys
+import json
 import traceback
-from flask import Flask, redirect, request, send_file
+from flask import Flask, request, redirect, send_file, jsonify
 from google.cloud import storage
+import google.generativeai as genai
 
-# Initialize Google Cloud Storage client
-storage_client = storage.Client()
-bucket_name = "sutcliff-fau-cloud-native"
-
-# Ensure local storage for temporary files
-os.makedirs('files', exist_ok=True)
-
+# Initialize Flask app
 app = Flask(__name__)
 
-def get_list_of_files(bucket_name):
-    """Lists all the blobs in the bucket."""
-    blobs = storage_client.list_blobs(bucket_name)
-    return [blob.name for blob in blobs]
+# Google Cloud Storage Configuration
+storage_client = storage.Client()
+BUCKET_NAME = "sutcliff-fau-cloud-native"
+LOCAL_DIR = "files"
 
-def upload_file(bucket_name, file_path):
-    """Uploads a file to the bucket."""
+# Ensure local directory exists
+os.makedirs(LOCAL_DIR, exist_ok=True)
+
+# Initialize Gemini AI API Key
+genai.configure(api_key=os.environ['GEMINI_API_KEY'])
+
+# Define the generation config
+generation_config = {
+    "temperature": 1,
+    "top_p": 0.95,
+    "top_k": 64,
+    "max_output_tokens": 8192,
+    "response_mime_type": "application/json",
+}
+
+# Initialize Gemini AI Model (Updated to Gemini 2.0)
+model = genai.GenerativeModel(
+    model_name="gemini-1.5-flash",
+    generation_config=generation_config,
+)
+
+# Prompt for AI model
+PROMPT = "Please generate a title and 1 paragraph description for the image. Your response should be in JSON format with only 2 attributes: title and description."
+
+def upload_to_gcs(bucket_name, file_path, blob_name):
+    """Uploads a file to Google Cloud Storage."""
     bucket = storage_client.bucket(bucket_name)
-    blob = bucket.blob(os.path.basename(file_path))
+    blob = bucket.blob(blob_name)
     blob.upload_from_filename(file_path)
 
-def download_file(bucket_name, file_name):
-    """Downloads a file from the bucket to the local directory."""
+def download_from_gcs(bucket_name, file_name):
+    """Downloads a file from Google Cloud Storage."""
     bucket = storage_client.bucket(bucket_name)
     blob = bucket.blob(file_name)
-    blob.download_to_filename(os.path.join("files", file_name))
-    return os.path.join("files", file_name)
+    local_path = os.path.join(LOCAL_DIR, file_name)
+    blob.download_to_filename(local_path)
+    return local_path
+
+def get_gcs_files(bucket_name):
+    """Lists all files in the GCS bucket."""
+    bucket = storage_client.bucket(bucket_name)
+    return [blob.name for blob in bucket.list_blobs()]
+
+def upload_to_gemini(path, mime_type="image/jpeg"):
+    """Uploads the given file to Gemini."""
+    file = genai.upload_file(path, mime_type=mime_type)
+    print(f"Uploaded file '{file.display_name}' as: {file.uri}")
+    return file
+
+def generate_image_caption(image_path):
+    """Uses Gemini 2.0 AI to generate a title and description for an image."""
+    # try:
+    # Upload file to Gemini
+    gemini_file = upload_to_gemini(image_path, mime_type="image/jpeg")
+
+    # Send request to Gemini AI
+    response = model.generate_content(
+        [gemini_file, "\n\n", PROMPT]
+    )
+
+    print("🔹 Raw Gemini AI Response:", response.text)
+
+    # Convert response to JSON format
+    response_text = response.text.strip()
+
+    # Ensure correct JSON parsing
+    metadata = json.loads(response_text) if response_text else {"title": "Untitled", "description": "No description available."}
+
+    # except (json.JSONDecodeError, AttributeError):
+    #     print("Error: Failed to parse JSON response from Gemini AI")
+    #     metadata = {"title": "Untitled", "description": "No description available."}
+
+    return metadata
 
 @app.route('/')
 def index():
-    """Main page with upload form and list of files."""
+    """Displays the file upload form and list of files."""
     index_html = """
     <form method="post" enctype="multipart/form-data" action="/upload">
-      <div>
         <label for="file">Choose file to upload</label>
         <input type="file" id="file" name="form_file" accept="image/jpeg"/>
-      </div>
-      <div>
         <button>Submit</button>
-      </div>
     </form>
-    <ul>
+    <hr><table width="80%" align="center">
     """
-    
-    for file in get_list_of_files(bucket_name):
-        if file.lower().endswith(('.jpeg', '.jpg')):
-            index_html += f'<li><a href="/files/{file}">{file}</a></li>'
-    
-    index_html += "</ul>"
+
+    idx = 0
+    for file in get_gcs_files(BUCKET_NAME):
+        if file.endswith(".jpeg") or file.endswith(".jpg"):
+            idx += 1
+            if idx % 2 == 1:
+                index_html += "<tr>"
+            index_html += f"""
+                <td width="50%">
+                    <a href="/files/{file}">
+                        <img width="100%" src="/image/{file}">
+                    </a>
+                </td>
+            """
+            if idx % 2 == 0:
+                index_html += "</tr>"
+
+    index_html += "</table>"
     return index_html
 
 @app.route('/upload', methods=["POST"])
 def upload():
-    """Handles file upload and stores it in Google Cloud Storage."""
-    file = request.files['form_file']
-    temp_path = os.path.join("files", file.filename)
-    file.save(temp_path)
-    upload_file(bucket_name, temp_path)
-    os.remove(temp_path)  # Clean up local storage
-    return redirect("/")
+    """Handles file upload and metadata generation."""
+    try:
+        file = request.files['form_file']
+        local_path = os.path.join(LOCAL_DIR, file.filename)
+        file.save(local_path)
 
-@app.route('/files')
-def list_files():
-    """Lists available JPEG files stored in Google Cloud Storage."""
-    files = get_list_of_files(bucket_name)
-    jpegs = [file for file in files if file.lower().endswith(('.jpeg', '.jpg'))]
-    return "<ul>" + "".join(f"<li><a href='/files/{file}'>{file}</a></li>" for file in jpegs) + "</ul>"
+        # Upload image to GCS
+        upload_to_gcs(BUCKET_NAME, local_path, file.filename)
 
-@app.route('/image/<filename>')
-def get_image(filename):
-    print("GET /image/" + filename)
-    return send_file(os.path.join("./files", filename))
+        # Generate caption using Gemini AI
+        metadata = generate_image_caption(local_path)
+
+        # Save metadata to a JSON file
+        json_path = local_path.replace(".jpeg", ".json").replace(".jpg", ".json")
+        with open(json_path, "w") as json_file:
+            json.dump(metadata, json_file)
+
+        # Upload JSON to GCS
+        json_filename = file.filename.replace(".jpeg", ".json").replace(".jpg", ".json")
+        upload_to_gcs(BUCKET_NAME, json_path, json_filename)
+
+        # Clean up local files
+        os.remove(local_path)
+        os.remove(json_path)
+
+        return redirect(f"/files/{file.filename}")
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/files/<filename>')
 def get_file(filename):
-    """Retrieves a file from Google Cloud Storage and displays it in the browser."""
-    print("GET /files/" + filename)
-    file_path = download_file(bucket_name, filename)
-    image_html = f"<h2>{filename}</h2>" + \
-                 f'<img src="/image/{filename}" width="500" height="333">'
-    return image_html
+    """Fetches the image and its corresponding JSON metadata."""
+    try:
+        image_path = download_from_gcs(BUCKET_NAME, filename)
+        json_path = download_from_gcs(BUCKET_NAME, filename.replace(".jpeg", ".json").replace(".jpg", ".json"))
+
+        with open(json_path, "r") as json_file:
+            metadata = json.load(json_file)
+
+        image_html = f"""
+        <h2>{metadata['title']}</h2>
+        <img src="/image/{filename}" width="500">
+        <p>{metadata['description']}</p>
+        <p><a href="/">Back</a></p>
+        """
+        return image_html
+    except Exception as e:
+        traceback.print_exc()
+        return f"<p>Error fetching file: {str(e)}</p>"
+
+@app.route('/image/<filename>')
+def get_image(filename):
+    """Serves an image from the local directory."""
+    return send_file(os.path.join(LOCAL_DIR, filename))
 
 if __name__ == '__main__':
     app.run(debug=True)
